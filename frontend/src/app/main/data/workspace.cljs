@@ -1433,6 +1433,19 @@
     (and (= 1 (count selected))
          (= :frame (get-in objects [(first selected) :type])))))
 
+(defn same-frame-from-selected? [state frame-id]
+  (let [selected (wsh/lookup-selected state)]
+     (contains? frame-id (first selected))))
+
+(defn frame-same-size?
+  [ paste-obj frame-obj]
+  (and
+   (= (:heigth (:selrect (first (vals paste-obj))))
+      (:heigth (:selrect frame-obj)))
+   (= (:width (:selrect (first (vals paste-obj))))
+      (:width (:selrect frame-obj)))))
+
+
 (defn- paste-shape
   [{selected :selected
     paste-objects :objects ;; rename this because here comes only the clipboard shapes,
@@ -1475,15 +1488,16 @@
                   selected-objs (map #(get paste-objects %) selected)
                   page-selected (wsh/lookup-selected state)
                   wrapper       (gsh/selection-rect selected-objs)
-                  orig-pos      (gpt/point (:x1 wrapper) (:y1 wrapper))]
+                  orig-pos      (gpt/point (:x1 wrapper) (:y1 wrapper))
+                  frame-id (first page-selected)
+                  frame-object (get page-objects frame-id)]
 
               (cond
                 ;; Pasting inside a frame
-                (selected-frame? state)
-                (let [frame-id (first page-selected)
-                      frame-object (get page-objects frame-id)
-
-                      origin-frame-id (:frame-id (first selected-objs))
+                (and (selected-frame? state) ;; When only one shape is selected and is a frame
+                     (not (same-frame-from-selected? state (first (vals paste-objects)))) ;; Not inside itself
+                     (not (frame-same-size? paste-objects frame-object))) ;; Or other frame with same exact size
+                (let [origin-frame-id (:frame-id (first selected-objs))
                       origin-frame-object (get page-objects origin-frame-id)
 
                       margin-x (-> (- (:width origin-frame-object) (+ (:x wrapper) (:width wrapper)))

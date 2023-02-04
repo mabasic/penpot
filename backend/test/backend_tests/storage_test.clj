@@ -40,7 +40,7 @@
         object  @(sto/put-object! storage {::sto/content content
                                            :content-type "text/plain"
                                            :other "data"})]
-    (t/is (sto/storage-object? object))
+    (t/is (sto/object? object))
     (t/is (fs/path? @(sto/get-object-path storage object)))
     (t/is (nil? (:expired-at object)))
     (t/is (= :assets-fs (:backend object)))
@@ -58,7 +58,7 @@
                                            ::sto/expired-at (dt/in-future {:seconds 1})
                                            :content-type "text/plain"
                                            })]
-    (t/is (sto/storage-object? object))
+    (t/is (sto/object? object))
     (t/is (dt/instant? (:expired-at object)))
     (t/is (dt/is-after? (:expired-at object) (dt/now)))
     (t/is (= object @(sto/get-object storage (:id object))))
@@ -77,7 +77,7 @@
         object  @(sto/put-object! storage {::sto/content content
                                            :content-type "text/plain"
                                            :expired-at (dt/in-future {:seconds 1})})]
-    (t/is (sto/storage-object? object))
+    (t/is (sto/object? object))
     (t/is (true? @(sto/del-object! storage object)))
 
     ;; retrieving the same object should be not nil because the

@@ -8,9 +8,11 @@
   "S3 Storage backend implementation."
   (:require
    [app.common.data :as d]
+   [app.common.data.macros :as dm]
    [app.common.exceptions :as ex]
    [app.common.spec :as us]
    [app.common.uri :as u]
+   [app.storage :as-alias sto]
    [app.storage.impl :as impl]
    [app.storage.tmp :as tmp]
    [app.util.time :as dt]
@@ -72,26 +74,26 @@
 (s/def ::endpoint ::us/string)
 
 (defmethod ig/pre-init-spec ::backend [_]
-  (s/keys :opt-un [::region ::bucket ::prefix ::endpoint ::wrk/executor]))
+  (s/keys :opt [::region ::bucket ::prefix ::endpoint ::wrk/executor]))
 
 (defmethod ig/prep-key ::backend
-  [_ {:keys [prefix region] :as cfg}]
+  [_ {:keys [::prefix ::region] :as cfg}]
   (cond-> (d/without-nils cfg)
-    (some? prefix) (assoc :prefix prefix)
-    (nil? region)  (assoc :region :eu-central-1)))
+    (some? prefix) (assoc ::prefix prefix)
+    (nil? region)  (assoc ::region :eu-central-1)))
 
 (defmethod ig/init-key ::backend
   [_ cfg]
   ;; Return a valid backend data structure only if all optional
   ;; parameters are provided.
-  (when (and (contains? cfg :region)
-             (string? (:bucket cfg)))
+  (when (and (contains? cfg ::region)
+             (string? (::bucket cfg)))
     (let [client    (build-s3-client cfg)
           presigner (build-s3-presigner cfg)]
       (assoc cfg
-             :client @client
-             :presigner presigner
-             :type :s3
+             ::sto/type :s3
+             ::client @client
+             ::presigner presigner
              ::close-fn #(.close ^java.lang.AutoCloseable client)))))
 
 (defmethod ig/halt-key! ::backend
@@ -99,21 +101,27 @@
   (when (fn? close-fn)
     (px/run! close-fn)))
 
-(s/def ::type ::us/keyword)
 (s/def ::client #(instance? S3AsyncClient %))
 (s/def ::presigner #(instance? S3Presigner %))
 (s/def ::backend
-  (s/keys :req-un [::region ::bucket ::client ::type ::presigner]
-          :opt-un [::prefix]))
+  (s/keys :req [::region
+                ::bucket
+                ::client
+                ::presigner]
+          :opt [::prefix
+                ::sto/id
+                ::wrk/executor]))
 
 ;; --- API IMPL
 
 (defmethod impl/put-object :s3
   [backend object content]
+  (us/assert! ::backend backend)
   (put-object backend object content))
 
 (defmethod impl/get-object-data :s3
   [backend object]
+  (us/assert! ::backend backend)
   (letfn [(no-such-key? [cause]
             (instance? software.amazon.awssdk.services.s3.model.NoSuchKeyException cause))
           (handle-not-found [cause]
@@ -127,18 +135,22 @@
 
 (defmethod impl/get-object-bytes :s3
   [backend object]
+  (us/assert! ::backend backend)
   (get-object-bytes backend object))
 
 (defmethod impl/get-object-url :s3
   [backend object options]
+  (us/assert! ::backend backend)
   (get-object-url backend object options))
 
 (defmethod impl/del-object :s3
   [backend object]
+  (us/assert! ::backend backend)
   (del-object backend object))
 
 (defmethod impl/del-objects-in-bulk :s3
   [backend ids]
+  (us/assert! ::backend backend)
   (del-object-in-bulk backend ids))
 
 ;; --- HELPERS
@@ -153,7 +165,7 @@
   (Region/of (name region)))
 
 (defn build-s3-client
-  [{:keys [region endpoint executor]}]
+  [{:keys [::region ::endpoint ::wrk/executor]}]
   (let [aconfig (-> (ClientAsyncConfiguration/builder)
                     (.advancedOption SdkAdvancedAsyncClientOption/FUTURE_COMPLETION_EXECUTOR executor)
                     (.build))
@@ -189,7 +201,7 @@
         (.close ^S3AsyncClient client)))))
 
 (defn build-s3-presigner
-  [{:keys [region endpoint]}]
+  [{:keys [::region ::endpoint]}]
   (let [config (-> (S3Configuration/builder)
                    (cond-> (some? endpoint) (.pathStyleAccessEnabled true))
                    (.build))]
@@ -242,23 +254,30 @@
 
 
 (defn put-object
-  [{:keys [client bucket prefix]} {:keys [id] :as object} content]
-  (p/let [path    (str prefix (impl/id->path id))
-          mdata   (meta object)
-          mtype   (:content-type mdata "application/octet-stream")
-          request (.. (PutObjectRequest/builder)
-                      (bucket bucket)
-                      (contentType mtype)
-                      (key path)
-                      (build))]
+  [{:keys [::client ::bucket ::prefix]} {:keys [id] :as object} content]
+  (let [path    (dm/str prefix (impl/id->path id))
+        mdata   (meta object)
+        mtype   (:content-type mdata "application/octet-stream")
+        content (make-request-body content)
+        request (.. (PutObjectRequest/builder)
+                    (bucket bucket)
+                    (contentType mtype)
+                    (key path)
+                    (build))]
 
-    (let [content (make-request-body content)]
-      (.putObject ^S3AsyncClient client
-                  ^PutObjectRequest request
-                  ^AsyncRequestBody content))))
+    (.putObject ^S3AsyncClient client
+                ^PutObjectRequest request
+                ^AsyncRequestBody content)))
+
+(defn- path->stream
+  [path]
+  (proxy [FilterInputStream] [(io/input-stream path)]
+    (close []
+      (fs/delete path)
+      (proxy-super close))))
 
 (defn get-object-data
-  [{:keys [client bucket prefix]} {:keys [id size]}]
+  [{:keys [::client ::bucket ::prefix]} {:keys [id size]}]
   (let [gor (.. (GetObjectRequest/builder)
                 (bucket bucket)
                 (key (str prefix (impl/id->path id)))
@@ -268,82 +287,82 @@
     ;; to the filesystem and then read with buffered inputstream; if
     ;; not, read the contento into memory using bytearrays.
     (if (> size (* 1024 1024 2))
-      (p/let [path (tmp/tempfile :prefix "penpot.storage.s3.")
-              rxf  (AsyncResponseTransformer/toFile ^Path path)
-              _    (.getObject ^S3AsyncClient client
-                               ^GetObjectRequest gor
-                               ^AsyncResponseTransformer rxf)]
-        (proxy [FilterInputStream] [(io/input-stream path)]
-          (close []
-            (fs/delete path)
-            (proxy-super close))))
+      (let [path (tmp/tempfile :prefix "penpot.storage.s3.")
+            rxf  (AsyncResponseTransformer/toFile ^Path path)]
+        (->> (.getObject ^S3AsyncClient client
+                         ^GetObjectRequest gor
+                         ^AsyncResponseTransformer rxf)
+             (p/fmap (constantly path))
+             (p/fmap path->stream)))
 
-      (p/let [rxf (AsyncResponseTransformer/toBytes)
-              obj (.getObject ^S3AsyncClient client
-                              ^GetObjectRequest gor
-                              ^AsyncResponseTransformer rxf)]
-        (.asInputStream ^ResponseBytes obj)))))
+      (let [rxf (AsyncResponseTransformer/toBytes)]
+        (->> (.getObject ^S3AsyncClient client
+                         ^GetObjectRequest gor
+                         ^AsyncResponseTransformer rxf)
+             (p/fmap #(.asInputStream ^ResponseBytes %)))))))
 
 (defn get-object-bytes
-  [{:keys [client bucket prefix]} {:keys [id]}]
-  (p/let [gor (.. (GetObjectRequest/builder)
-                  (bucket bucket)
-                  (key (str prefix (impl/id->path id)))
-                  (build))
-          rxf (AsyncResponseTransformer/toBytes)
-          obj (.getObject ^S3AsyncClient client
-                          ^GetObjectRequest gor
-                          ^AsyncResponseTransformer rxf)]
-    (.asByteArray ^ResponseBytes obj)))
+  [{:keys [::client ::bucket ::prefix]} {:keys [id]}]
+  (let [gor (.. (GetObjectRequest/builder)
+                (bucket bucket)
+                (key (str prefix (impl/id->path id)))
+                (build))
+        rxf (AsyncResponseTransformer/toBytes)]
+    (->> (.getObject ^S3AsyncClient client
+                     ^GetObjectRequest gor
+                     ^AsyncResponseTransformer rxf)
+         (p/fmap #(.asByteArray ^ResponseBytes %)))))
 
 (def default-max-age
   (dt/duration {:minutes 10}))
 
 (defn get-object-url
-  [{:keys [presigner bucket prefix]} {:keys [id]} {:keys [max-age] :or {max-age default-max-age}}]
+  [{:keys [::presigner ::bucket ::prefix]} {:keys [id]} {:keys [max-age] :or {max-age default-max-age}}]
   (us/assert dt/duration? max-age)
-  (p/do
-    (let [gor  (.. (GetObjectRequest/builder)
-                   (bucket bucket)
-                   (key (str prefix (impl/id->path id)))
-                   (build))
-          gopr (.. (GetObjectPresignRequest/builder)
-                   (signatureDuration ^Duration max-age)
-                   (getObjectRequest ^GetObjectRequest gor)
-                   (build))
-          pgor (.presignGetObject ^S3Presigner presigner ^GetObjectPresignRequest gopr)]
-      (u/uri (str (.url ^PresignedGetObjectRequest pgor))))))
+  (let [gor  (.. (GetObjectRequest/builder)
+                 (bucket bucket)
+                 (key (dm/str prefix (impl/id->path id)))
+                 (build))
+        gopr (.. (GetObjectPresignRequest/builder)
+                 (signatureDuration ^Duration max-age)
+                 (getObjectRequest ^GetObjectRequest gor)
+                 (build))
+        pgor (.presignGetObject ^S3Presigner presigner ^GetObjectPresignRequest gopr)]
+    (p/resolved
+     (u/uri (str (.url ^PresignedGetObjectRequest pgor))))))
 
 (defn del-object
-  [{:keys [bucket client prefix]} {:keys [id] :as obj}]
-  (p/let [dor (.. (DeleteObjectRequest/builder)
-                  (bucket bucket)
-                  (key (str prefix (impl/id->path id)))
-                  (build))]
-    (.deleteObject ^S3AsyncClient client
-                   ^DeleteObjectRequest dor)))
+  [{:keys [::bucket ::client ::prefix]} {:keys [id] :as obj}]
+  (let [dor (.. (DeleteObjectRequest/builder)
+                (bucket bucket)
+                (key (dm/str prefix (impl/id->path id)))
+                (build))]
+    (->> (.deleteObject ^S3AsyncClient client ^DeleteObjectRequest dor)
+         (p/fmap (constantly nil)))))
 
 (defn del-object-in-bulk
-  [{:keys [bucket client prefix]} ids]
-  (p/let [oids (map (fn [id]
-                      (.. (ObjectIdentifier/builder)
-                          (key (str prefix (impl/id->path id)))
-                          (build)))
-                    ids)
-          delc (.. (Delete/builder)
-                   (objects ^Collection oids)
-                   (build))
-          dor  (.. (DeleteObjectsRequest/builder)
-                   (bucket bucket)
-                   (delete ^Delete delc)
-                   (build))
-          dres (.deleteObjects ^S3AsyncClient client
-                               ^DeleteObjectsRequest dor)]
-    (when (.hasErrors ^DeleteObjectsResponse dres)
-      (let [errors (seq (.errors ^DeleteObjectsResponse dres))]
-        (ex/raise :type :internal
-                  :code :error-on-s3-bulk-delete
-                  :s3-errors (mapv (fn [^S3Error error]
-                                     {:key (.key error)
-                                      :msg (.message error)})
-                                   errors))))))
+  [{:keys [::bucket ::client ::prefix]} ids]
+
+  (let [oids (map (fn [id]
+                    (.. (ObjectIdentifier/builder)
+                        (key (str prefix (impl/id->path id)))
+                        (build)))
+                  ids)
+        delc (.. (Delete/builder)
+                 (objects ^Collection oids)
+                 (build))
+        dor  (.. (DeleteObjectsRequest/builder)
+                 (bucket bucket)
+                 (delete ^Delete delc)
+                 (build))]
+
+    (->> (.deleteObjects ^S3AsyncClient client ^DeleteObjectsRequest dor)
+         (p/fmap (fn [dres]
+                   (when (.hasErrors ^DeleteObjectsResponse dres)
+                     (let [errors (seq (.errors ^DeleteObjectsResponse dres))]
+                       (ex/raise :type :internal
+                                 :code :error-on-s3-bulk-delete
+                                 :s3-errors (mapv (fn [^S3Error error]
+                                                    {:key (.key error)
+                                                     :msg (.message error)})
+                                                  errors)))))))))
